@@ -90,4 +90,184 @@ AAM-Optimus-v21.8/
 
 **Скажи номер — и я переключусь в нужный режим с готовыми гайдами.**
 
-Ты уже на финише. Просто выбери направление. 🎯
+Ты уже на финише. Просто выбери направление. 🎯import numpy as np
+from collections import deque
+from typing import Dict, Any, Tuple
+
+class SurfaceSignatureExtractor_v21_8:
+    """
+    v21.8 — Дожатая версия с плавным переходом, contact memory и impedance envelope
+    """
+
+    def __init__(self):
+        self.phase = "IDLE"
+        self.t_start = 0.0
+
+        self.signature = {
+            "stiffness": 0.0,
+            "sink_rate": 0.0,
+            "friction_est": 0.82,
+            "slip_detected": False,
+            "surface_type": "UNKNOWN"
+        }
+
+        self.friction_memory = 0.82          # долгосрочная память
+        self.force_history = deque(maxlen=40)
+        self.vel_history = deque(maxlen=40)
+
+        self.whisper_amp = 0.006
+        self.whisper_freq = 19.0
+
+    def reset(self):
+        self.phase = "IDLE"
+        self.signature["slip_detected"] = False
+        self.force_history.clear()
+        self.vel_history.clear()
+
+    def get_adaptive_durations(self, trust: float):
+        caution = 1.0 + (1.0 - trust) * 1.45
+        return 0.07*caution, 0.10*caution, 0.12*caution
+
+    def execute(self, sensors: Dict, t: float, trust: float) -> Tuple[np.ndarray, float, str]:
+        """
+        Возвращает: action, yield_factor (0..1), status
+        """
+        if self.phase == "IDLE":
+            self.t_start = t
+            self.phase = "APPROACH_WHISPER"
+
+        elapsed = t - self.t_start
+        t1, t2, t3 = self.get_adaptive_durations(trust)
+
+        fz = sensors.get("force_z", 0.0)
+        v_xy = np.linalg.norm(sensors.get("velocity_xy", np.zeros(2)))
+
+        self.force_history.append(fz)
+        self.vel_history.append(sensors.get("velocity_z", 0.0))
+
+        yield_factor = 1.0
+
+        # PHASE 0: APPROACH_WHISPER (с memory update)
+        if self.phase == "APPROACH_WHISPER":
+            whisper = np.array([
+                np.sin(2 * np.pi * self.whisper_freq * t) * self.whisper_amp,
+                np.cos(2 * np.pi * self.whisper_freq * t) * self.whisper_amp * 0.6,
+                0.0
+            ])
+
+            slip_error = np.linalg.norm(whisper[:2] - v_xy)
+            self.signature["friction_est"] = 0.82 * self.signature["friction_est"] + 0.18 * np.exp(-slip_error * 38)
+
+            # Обновляем долгосрочную память
+            self.friction_memory = 0.88 * self.friction_memory + 0.12 * self.signature["friction_est"]
+
+            if self.signature["friction_est"] < 0.27 and fz < 70.0:
+                yield_factor = np.clip(self.signature["friction_est"] / 0.27, 0.15, 1.0)
+                return whisper * 0.25, yield_factor, "SOFT_ABORT"
+
+            if elapsed > 0.11:
+                self.phase = "LIGHT_TOUCH"
+            return whisper * 0.35, yield_factor, "APPROACH_WHISPER"
+
+        # PHASE 1: LIGHT_TOUCH
+        if self.phase == "LIGHT_TOUCH":
+            load = min(elapsed / t1, 1.0) * 0.06
+            action = np.array([0.0, 0.0, -load], dtype=np.float32)
+
+            if elapsed >= t1:
+                self.signature["compliance"] = abs(sensors.get("delta_z", 0.0)) / (fz + 1e-8)
+                if self.signature["compliance"] > 0.032:
+                    self.signature["surface_type"] = "SOFT"
+                    self.phase = "DONE"
+                    return action, yield_factor, "SOFT_EARLY"
+                self.phase = "VERTICAL_RAMP"
+            return action, yield_factor, "LIGHT_TOUCH"
+
+        # PHASE 2: VERTICAL_RAMP
+        if self.phase == "VERTICAL_RAMP":
+            progress = min((elapsed - t1) / t2, 1.0)
+            load = 0.06 + progress * 0.16
+            action = np.array([0.0, 0.0, -load], dtype=np.float32)
+
+            if elapsed >= t1 + t2:
+                if self.signature["sink_rate"] > 0.09:
+                    self.signature["surface_type"] = "SINK"
+                    self.phase = "DONE"
+                    return action, yield_factor, "SINK_DETECTED"
+                self.phase = "MICRO_SLIP_TEST"
+            return action, yield_factor, "VERTICAL_RAMP"
+
+        # PHASE 3: MICRO_SLIP_TEST
+        if self.phase == "MICRO_SLIP_TEST":
+            progress = min((elapsed - t1 - t2) / t3, 1.0)
+            f_lat = progress * 0.075
+            angle = (elapsed - t1 - t2) * 26.0
+            fx = f_lat * np.cos(angle)
+            fy = f_lat * 0.7 * np.sin(angle)
+            action = np.array([fx, fy, -0.185], dtype=np.float32)
+
+            if v_xy > 0.029:
+                self.signature["slip_detected"] = True
+                self.signature["friction_est"] = f_lat / (fz + 1e-6)
+                self.signature["surface_type"] = "SLIPPERY"
+                self.phase = "DONE"
+                return action, yield_factor, "SLIP_DETECTED"
+
+            if elapsed >= t1 + t2 + t3:
+                self.signature["surface_type"] = "RIGID"
+                self.phase = "DONE"
+                return action, yield_factor, "RIGID_STABLE"
+
+            return action, yield_factor, "MICRO_SLIP_TEST"
+
+        return np.zeros(3, dtype=np.float32), 1.0, "DONE"
+
+
+class AAM_Optimus_v21_8:
+    """
+    v21.8 — Дожатая production-ориентированная версия
+    """
+    def __init__(self):
+        self.probe = SurfaceSignatureExtractor_v21_8()
+        self.modulation_prev = np.zeros(3, dtype=np.float32)
+        self.friction_memory = 0.82
+
+    def step(self, sensors: Dict[str, Any], current_time: float) -> np.ndarray:
+        trust = sensors.get("trust_blend", 0.8)
+
+        probe_action, yield_factor, status = self.probe.execute(sensors, current_time, trust)
+
+        # Обновляем память контакта
+        self.friction_memory = 0.88 * self.friction_memory + 0.12 * self.probe.signature["friction_est"]
+
+        if status == "SOFT_ABORT" or yield_factor < 0.3:
+            return np.zeros(3, dtype=np.float32)
+
+        intent = sensors.get("target_vector", np.zeros(3, dtype=np.float32))
+        vel = sensors.get("velocity", np.zeros(3, dtype=np.float32))
+
+        mismatch = np.linalg.norm(intent - vel)
+
+        # Impedance Envelope
+        damping = 1.0 + mismatch * 2.4 + (1.0 - self.friction_memory) * 1.8
+
+        raw_action = intent / damping
+
+        # Soft merge probing influence
+        action = raw_action * yield_factor + probe_action * 0.35
+
+        # Final smoothing
+        action = 0.37 * action + 0.63 * self.modulation_prev
+        self.modulation_prev = action.copy()
+
+        return action.astype(np.float32)
+
+    def get_diagnostics(self) -> Dict:
+        return {
+            "trust_blend": round(self.probe.signature.get("trust_blend", 0.8), 3),
+            "friction_est": round(self.probe.signature["friction_est"], 3),
+            "friction_memory": round(self.friction_memory, 3),
+            "yield_factor": round(self.probe.signature.get("yield_factor", 1.0), 3),
+            "surface_type": self.probe.signature["surface_type"],
+            "probe_phase": self.probe.phase
+        }
